@@ -1,4 +1,4 @@
-from std.math import ceildiv
+from std.math import ceildiv, min
 from std.sys import has_accelerator
 from std.gpu.sync import barrier
 from std.gpu.host import DeviceContext
@@ -6,11 +6,26 @@ from std.gpu import thread_idx, block_idx
 from std.gpu.memory import AddressSpace
 from layout import TileTensor, stack_allocation, row_major, Coord, Idx
 from std.time import perf_counter
+from std.collections import InlineArray
 
 comptime float_dtype = DType.float32
-comptime TILE_M = 16
-comptime TILE_N = 16
-comptime TILE_K = 16
+comptime BM = 128
+comptime BN = 128
+comptime BK = 32
+comptime VEC_W = 16
+comptime THREADS_M = 16
+comptime THREADS_N = 16
+comptime THREADS = THREADS_M * THREADS_N
+comptime ELEMS_M = BM // THREADS_M
+comptime ELEMS_N = BN // THREADS_N
+comptime a_elems = BM * BK // THREADS
+comptime b_elems = BK * BN // THREADS
+comptime a_groups = a_elems // VEC_W
+comptime a_rem = a_elems % VEC_W
+comptime b_groups = b_elems // VEC_W
+comptime b_rem = b_elems % VEC_W
+comptime a_smem_layout = row_major(Coord(Idx(BM), Idx(BK)))
+comptime b_smem_layout = row_major(Coord(Idx(BK), Idx(BN)))
 
 @parameter
 def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
@@ -21,59 +36,126 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
     comptime b_layout = row_major[K, N]()
     comptime c_layout = row_major[M, N]()
 
-    def tiled_matmul_kernel(
+    def kernel(
         A: TileTensor[float_dtype, type_of(a_layout), MutAnyOrigin],
         B: TileTensor[float_dtype, type_of(b_layout), MutAnyOrigin],
         C: TileTensor[float_dtype, type_of(c_layout), MutAnyOrigin],
     ):
-        var tx = thread_idx.x
-        var ty = thread_idx.y
-        var bx = block_idx.x
+        var tid = thread_idx.x
+        var ty = tid // THREADS_N
+        var tx = tid % THREADS_N
         var by = block_idx.y
+        var bx = block_idx.x
 
-        var global_row = by * TILE_M + ty
-        var global_col = bx * TILE_N + tx
+        var m_start = by * BM
+        var n_start = bx * BN
 
-        var tile_row_start = by * TILE_M
-        var tile_col_start = bx * TILE_N
+        var a_smem = stack_allocation[float_dtype, address_space=AddressSpace.SHARED](
+            a_smem_layout
+        )
+        var b_smem = stack_allocation[float_dtype, address_space=AddressSpace.SHARED](
+            b_smem_layout
+        )
 
-        var a_tile = stack_allocation[
-            float_dtype, address_space=AddressSpace.SHARED
-        ](row_major(Coord(Idx(TILE_M), Idx(TILE_K))))
-        var b_tile = stack_allocation[
-            float_dtype, address_space=AddressSpace.SHARED
-        ](row_major(Coord(Idx(TILE_K), Idx(TILE_N))))
+        var accum = InlineArray[SIMD[float_dtype, ELEMS_N], ELEMS_M](
+            uninitialized=True
+        )
+        comptime for i in range(ELEMS_M):
+            accum[i] = SIMD[float_dtype, ELEMS_N](0)
 
-        var accumulator: C.ElementType = 0.0
+        for kt in range(0, K, BK):
+            var kb = min(BK, K - kt)
 
-        comptime for k_tile in range(0, K, TILE_K):
-            var a_global_row = tile_row_start + ty
-            var a_global_col = k_tile + tx
-            var b_global_row = k_tile + ty
-            var b_global_col = tile_col_start + tx
+            if kb < BK:
+                comptime for j in range(a_groups):
+                    a_smem.raw_store[width=VEC_W](
+                        tid * a_elems + j * VEC_W, SIMD[float_dtype, VEC_W](0)
+                    )
+                comptime for j in range(b_groups):
+                    b_smem.raw_store[width=VEC_W](
+                        tid * b_elems + j * VEC_W, SIMD[float_dtype, VEC_W](0)
+                    )
 
-            var load_a_valid = (a_global_row < M) and (a_global_col < K)
-            var load_b_valid = (b_global_row < K) and (b_global_col < N)
+            comptime for j in range(a_groups):
+                var idx = tid * a_elems + j * VEC_W
+                var r = idx // BK
+                var c = idx % BK
+                var gr = m_start + r
+                var gc = kt + c
+                if gr < M and gc + VEC_W <= K:
+                    a_smem.raw_store[width=VEC_W](
+                        r * BK + c,
+                        A.raw_load[width=VEC_W](gr * K + gc),
+                    )
+                else:
+                    var v = SIMD[float_dtype, VEC_W](0)
+                    for k in range(VEC_W):
+                        if gr < M and gc + k < K:
+                            v[k] = A[gr, gc + k]
+                    a_smem.raw_store[width=VEC_W](r * BK + c, v)
+            comptime for j in range(a_rem):
+                var idx = tid * a_elems + a_groups * VEC_W + j
+                var r = idx // BK
+                var c = idx % BK
+                var gr = m_start + r
+                var gc = kt + c
+                if gr < M and gc < K:
+                    a_smem[r, c] = A[gr, gc]
+                else:
+                    a_smem[r, c] = 0.0
 
-            if load_a_valid:
-                a_tile[ty, tx] = A[a_global_row, a_global_col]
-            else:
-                a_tile[ty, tx] = 0.0
-
-            if load_b_valid:
-                b_tile[ty, tx] = B[b_global_row, b_global_col]
-            else:
-                b_tile[ty, tx] = 0.0
+            comptime for j in range(b_groups):
+                var idx = tid * b_elems + j * VEC_W
+                var r = idx // BN
+                var c = idx % BN
+                var gr = kt + r
+                var gc = n_start + c
+                if gr < K and gc + VEC_W <= N:
+                    b_smem.raw_store[width=VEC_W](
+                        r * BN + c,
+                        B.raw_load[width=VEC_W](gr * N + gc),
+                    )
+                else:
+                    var v = SIMD[float_dtype, VEC_W](0)
+                    for k in range(VEC_W):
+                        if gr < K and gc + k < N:
+                            v[k] = B[gr, gc + k]
+                    b_smem.raw_store[width=VEC_W](r * BN + c, v)
+            comptime for j in range(b_rem):
+                var idx = tid * b_elems + b_groups * VEC_W + j
+                var r = idx // BN
+                var c = idx % BN
+                var gr = kt + r
+                var gc = n_start + c
+                if gr < K and gc < N:
+                    b_smem[r, c] = B[gr, gc]
+                else:
+                    b_smem[r, c] = 0.0
 
             barrier()
 
-            comptime for k in range(TILE_K):
-                accumulator += a_tile[ty, k] * b_tile[k, tx]
+            comptime for kk in range(BK):
+                var b_vals = b_smem.raw_load[width=ELEMS_N](
+                    kk * BN + tx * ELEMS_N
+                )
+                comptime for i in range(ELEMS_M):
+                    var a_val = a_smem[ty * ELEMS_M + i, kk]
+                    for j in range(ELEMS_N):
+                        accum[i][j] += a_val * b_vals[j]
 
             barrier()
 
-        if (global_row < M) and (global_col < N):
-            C[global_row, global_col] = accumulator
+        comptime for i in range(ELEMS_M):
+            var crow = m_start + ty * ELEMS_M + i
+            var ccol = n_start + tx * ELEMS_N
+            if crow < M and ccol + ELEMS_N <= N:
+                C.raw_store[width=ELEMS_N](
+                    crow * N + ccol, accum[i]
+                )
+            else:
+                for j in range(ELEMS_N):
+                    if crow < M and ccol + j < N:
+                        C[crow, ccol + j] = accum[i][j]
 
     print("\n--- Size ", M, " ---")
 
@@ -102,21 +184,21 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
     var db = TileTensor(buf_b, b_layout)
     var dc = TileTensor(buf_c, c_layout)
 
-    var num_blocks_x = ceildiv(N, TILE_N)
-    var num_blocks_y = ceildiv(M, TILE_M)
-    ctx.enqueue_function[tiled_matmul_kernel](
+    var grid_x = ceildiv(N, BN)
+    var grid_y = ceildiv(M, BM)
+    ctx.enqueue_function[kernel](
         da, db, dc,
-        grid_dim=(num_blocks_x, num_blocks_y),
-        block_dim=(TILE_N, TILE_M),
+        grid_dim=(grid_x, grid_y),
+        block_dim=(THREADS, 1),
     )
     ctx.synchronize()
 
     var t0 = perf_counter()
     for _ in range(100):
-        ctx.enqueue_function[tiled_matmul_kernel](
+        ctx.enqueue_function[kernel](
             da, db, dc,
-            grid_dim=(num_blocks_x, num_blocks_y),
-            block_dim=(TILE_N, TILE_M),
+            grid_dim=(grid_x, grid_y),
+            block_dim=(THREADS, 1),
         )
     ctx.synchronize()
     var t1 = perf_counter()
@@ -147,8 +229,8 @@ def main() raises:
         print("No GPU accelerator detected")
         return
 
-    print("--- General-Purpose Mojo GPU GEMM (tiled, cross-platform) ---")
-    print("Square tile-aligned matrices:")
+    print("--- General-Purpose Mojo GPU GEMM (optimized tiled) ---")
+    print("Tile-aligned square matrices:")
     bench[256, 256, 256]()
     bench[512, 512, 512]()
     bench[1024, 1024, 1024]()
