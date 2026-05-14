@@ -1,4 +1,6 @@
 import time
+import os
+import sys
 import numpy as np
 import warp as wp
 
@@ -7,8 +9,17 @@ wp.init()
 
 if not wp.is_cuda_available():
     print("\n=== Warp GPU Matmul ===")
-    print("No CUDA GPU available — this benchmark requires an NVIDIA GPU")
-    print("Install warp-lang with CUDA: pip install warp-lang")
+    print("ERROR: No CUDA GPU available — Warp needs NVIDIA CUDA")
+    print()
+    print("Causes and fixes:")
+    print("  1. warp-lang installed without CUDA support")
+    print("     -> pip install --upgrade warp-lang  (ensures CUDA is detected)")
+    print("  2. CUDA toolkit not found at install time")
+    print("     -> export CUDA_PATH=/usr/local/cuda && pip install --upgrade warp-lang")
+    print("  3. If using pixi, recreate the environment ON the GPU machine:")
+    print("     -> rm -rf .pixi && pixi install")
+    print()
+    sys.stdout.flush()
     exit(0)
 
 TILE_M = wp.constant(64)
