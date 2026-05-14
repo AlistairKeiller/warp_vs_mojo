@@ -10,7 +10,7 @@ from std.time import perf_counter
 comptime float_dtype = DType.float32
 comptime BM = 32
 comptime BN = 32
-comptime BK = 32
+comptime BK = 64
 comptime RT = 2
 comptime TH_Y = BM // RT
 comptime TH_X = BN
@@ -52,28 +52,51 @@ def bench[size: Int]() raises:
 
             var a_row0 = by * BM + ty * RT
             var a_row1 = a_row0 + 1
-            var a_col = kt + tx
-            if a_row0 < M and a_col < K:
-                tile_a[ty * RT, tx] = A[a_row0, a_col]
+            var a_col0 = kt + tx
+            var a_col1 = kt + tx + TH_X
+
+            if a_row0 < M and a_col0 < K:
+                tile_a[ty * RT, tx] = A[a_row0, a_col0]
             else:
                 tile_a[ty * RT, tx] = 0.0
-            if a_row1 < M and a_col < K:
-                tile_a[ty * RT + 1, tx] = A[a_row1, a_col]
+            if a_row0 < M and a_col1 < K:
+                tile_a[ty * RT, tx + TH_X] = A[a_row0, a_col1]
+            else:
+                tile_a[ty * RT, tx + TH_X] = 0.0
+            if a_row1 < M and a_col0 < K:
+                tile_a[ty * RT + 1, tx] = A[a_row1, a_col0]
             else:
                 tile_a[ty * RT + 1, tx] = 0.0
+            if a_row1 < M and a_col1 < K:
+                tile_a[ty * RT + 1, tx + TH_X] = A[a_row1, a_col1]
+            else:
+                tile_a[ty * RT + 1, tx + TH_X] = 0.0
 
-            var b_row = kt + ty
             var b_col = bx * BN + tx
-            if b_row < K and b_col < N:
-                tile_b[ty, tx] = B[b_row, b_col]
+
+            var b_row0 = kt + ty
+            if b_row0 < K and b_col < N:
+                tile_b[ty, tx] = B[b_row0, b_col]
             else:
                 tile_b[ty, tx] = 0.0
 
-            b_row = kt + ty + TH_Y
-            if b_row < K and b_col < N:
-                tile_b[ty + TH_Y, tx] = B[b_row, b_col]
+            var b_row1 = kt + ty + TH_Y
+            if b_row1 < K and b_col < N:
+                tile_b[ty + TH_Y, tx] = B[b_row1, b_col]
             else:
                 tile_b[ty + TH_Y, tx] = 0.0
+
+            var b_row2 = kt + ty + 2 * TH_Y
+            if b_row2 < K and b_col < N:
+                tile_b[ty + 2 * TH_Y, tx] = B[b_row2, b_col]
+            else:
+                tile_b[ty + 2 * TH_Y, tx] = 0.0
+
+            var b_row3 = kt + ty + 3 * TH_Y
+            if b_row3 < K and b_col < N:
+                tile_b[ty + 3 * TH_Y, tx] = B[b_row3, b_col]
+            else:
+                tile_b[ty + 3 * TH_Y, tx] = 0.0
 
             barrier()
 
@@ -125,11 +148,11 @@ def bench[size: Int]() raises:
     ctx.synchronize()
 
     var t0 = perf_counter()
-    for _ in range(10):
+    for _ in range(100):
         ctx.enqueue_function[kernel](da, db, dc, grid_dim=(grid_x, grid_y), block_dim=(TH_X, TH_Y))
     ctx.synchronize()
     var t1 = perf_counter()
-    var elapsed = (t1 - t0) / 10.0
+    var elapsed = (t1 - t0) / 100.0
 
     var gflops = 2.0 * Float64(M) * Float64(N) * Float64(K) / (elapsed * 1e9)
     print("GPU Matmul: ", elapsed, "s  ", gflops, " GFLOPS/s")
@@ -155,7 +178,7 @@ def main() raises:
     comptime if not has_accelerator():
         print("No GPU accelerator detected — requires Metal (macOS) or CUDA (NVIDIA)")
     else:
-        print("--- Mojo GPU Matmul (2x1 reg-tiled, ", TH_X, "x", TH_Y, " threads) ---")
+        print("--- Mojo GPU Matmul (BK=64, 2x1 reg-tiled) ---")
         print("Device: auto (Metal on macOS, CUDA on NVIDIA)")
         bench[256]()
         bench[512]()
