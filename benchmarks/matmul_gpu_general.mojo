@@ -9,22 +9,18 @@ from std.time import perf_counter
 from std.collections import InlineArray
 
 comptime float_dtype = DType.float32
-comptime BM = 128
-comptime BN = 128
+comptime BM = 64
+comptime BN = 64
 comptime BK = 32
+comptime BK_PAD = BK + 1
 comptime VEC_W = 16
 comptime THREADS_M = 16
 comptime THREADS_N = 16
 comptime THREADS = THREADS_M * THREADS_N
 comptime ELEMS_M = BM // THREADS_M
 comptime ELEMS_N = BN // THREADS_N
-comptime a_elems = BM * BK // THREADS
-comptime b_elems = BK * BN // THREADS
-comptime a_groups = a_elems // VEC_W
-comptime a_rem = a_elems % VEC_W
-comptime b_groups = b_elems // VEC_W
-comptime b_rem = b_elems % VEC_W
-comptime a_smem_layout = row_major(Coord(Idx(BM), Idx(BK)))
+
+comptime a_smem_layout = row_major(Coord(Idx(BM), Idx(BK_PAD)))
 comptime b_smem_layout = row_major(Coord(Idx(BK), Idx(BN)))
 
 @parameter
@@ -57,6 +53,13 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
             b_smem_layout
         )
 
+        comptime a_elems = BM * BK // THREADS
+        comptime b_elems = BK * BN // THREADS
+        comptime a_groups = a_elems // VEC_W
+        comptime a_rem = a_elems % VEC_W
+        comptime b_groups = b_elems // VEC_W
+        comptime b_rem = b_elems % VEC_W
+
         var accum = InlineArray[SIMD[float_dtype, ELEMS_N], ELEMS_M](
             uninitialized=True
         )
@@ -68,13 +71,25 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
 
             if kb < BK:
                 comptime for j in range(a_groups):
+                    var idx = tid * a_elems + j * VEC_W
+                    var r = idx // BK
+                    var c = idx % BK
                     a_smem.raw_store[width=VEC_W](
-                        tid * a_elems + j * VEC_W, SIMD[float_dtype, VEC_W](0)
+                        r * BK_PAD + c, SIMD[float_dtype, VEC_W](0)
                     )
+                comptime for j in range(a_rem):
+                    var idx = tid * a_elems + a_groups * VEC_W + j
+                    a_smem[idx // BK, idx % BK] = 0.0
                 comptime for j in range(b_groups):
+                    var idx = tid * b_elems + j * VEC_W
+                    var r = idx // BN
+                    var c = idx % BN
                     b_smem.raw_store[width=VEC_W](
-                        tid * b_elems + j * VEC_W, SIMD[float_dtype, VEC_W](0)
+                        r * BN + c, SIMD[float_dtype, VEC_W](0)
                     )
+                comptime for j in range(b_rem):
+                    var idx = tid * b_elems + b_groups * VEC_W + j
+                    b_smem[idx // BN, idx % BN] = 0.0
 
             comptime for j in range(a_groups):
                 var idx = tid * a_elems + j * VEC_W
@@ -84,7 +99,7 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
                 var gc = kt + c
                 if gr < M and gc + VEC_W <= K:
                     a_smem.raw_store[width=VEC_W](
-                        r * BK + c,
+                        r * BK_PAD + c,
                         A.raw_load[width=VEC_W](gr * K + gc),
                     )
                 else:
@@ -92,7 +107,7 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
                     for k in range(VEC_W):
                         if gr < M and gc + k < K:
                             v[k] = A[gr, gc + k]
-                    a_smem.raw_store[width=VEC_W](r * BK + c, v)
+                    a_smem.raw_store[width=VEC_W](r * BK_PAD + c, v)
             comptime for j in range(a_rem):
                 var idx = tid * a_elems + a_groups * VEC_W + j
                 var r = idx // BK
@@ -140,7 +155,7 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
                 )
                 comptime for i in range(ELEMS_M):
                     var a_val = a_smem[ty * ELEMS_M + i, kk]
-                    for j in range(ELEMS_N):
+                    comptime for j in range(ELEMS_N):
                         accum[i][j] += a_val * b_vals[j]
 
             barrier()
@@ -229,7 +244,7 @@ def main() raises:
         print("No GPU accelerator detected")
         return
 
-    print("--- General-Purpose Mojo GPU GEMM (optimized tiled) ---")
+    print("--- General-Purpose Mojo GPU GEMM (tiled FMA, padded A-smem stride) ---")
     print("Tile-aligned square matrices:")
     bench[256, 256, 256]()
     bench[512, 512, 512]()
