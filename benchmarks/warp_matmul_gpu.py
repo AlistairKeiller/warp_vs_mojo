@@ -8,7 +8,7 @@ wp.init()
 if not wp.is_cuda_available():
     print("\n=== Warp GPU Matmul ===")
     print("No CUDA GPU available — this benchmark requires an NVIDIA GPU")
-    print("On macOS, Warp has no Metal backend; run on an NVIDIA machine")
+    print("Install warp-lang with CUDA: pip install warp-lang")
     exit(0)
 
 TILE_M = wp.constant(64)
@@ -104,7 +104,7 @@ if __name__ == "__main__":
     print(f"\n=== Warp GPU Matmul ===")
     print(f"Device: {device} (CUDA)")
 
-    for size in [256, 512, 1024]:
+    for size in [256, 512, 1024, 2048]:
         benchmark(size, size, size)
 
     verify()

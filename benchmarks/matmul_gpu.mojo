@@ -8,14 +8,12 @@ from layout import TileTensor, stack_allocation, row_major, Coord, Idx
 from std.time import perf_counter
 
 comptime float_dtype = DType.float32
+comptime BM = 32
+comptime BN = 32
+comptime BK = 32
 
-comptime TILE_M = 32
-comptime TILE_N = 32
-comptime TILE_K = 32
-
-comptime tile_a_layout = row_major(Coord(Idx(TILE_M), Idx(TILE_K)))
-comptime tile_b_layout = row_major(Coord(Idx(TILE_K), Idx(TILE_N)))
-
+comptime tile_a_layout = row_major(Coord(Idx(BM), Idx(BK)))
+comptime tile_b_layout = row_major(Coord(Idx(BK), Idx(BN)))
 
 @parameter
 def bench[size: Int]() raises:
@@ -25,6 +23,9 @@ def bench[size: Int]() raises:
     comptime a_layout = row_major[M, K]()
     comptime b_layout = row_major[K, N]()
     comptime c_layout = row_major[M, N]()
+
+    comptime grid_x = ceildiv(N, BN)
+    comptime grid_y = ceildiv(M, BM)
 
     def kernel(
         A: TileTensor[float_dtype, type_of(a_layout), MutAnyOrigin],
@@ -36,41 +37,36 @@ def bench[size: Int]() raises:
         var bx = block_idx.x
         var by = block_idx.y
 
-        var tile_a = stack_allocation[
-            float_dtype, address_space=AddressSpace.SHARED
-        ](tile_a_layout)
-        var tile_b = stack_allocation[
-            float_dtype, address_space=AddressSpace.SHARED
-        ](tile_b_layout)
+        var tile_a = stack_allocation[float_dtype, address_space=AddressSpace.SHARED](tile_a_layout)
+        var tile_b = stack_allocation[float_dtype, address_space=AddressSpace.SHARED](tile_b_layout)
 
         var acc: Float32 = 0.0
-        var kt = 0
-        while kt < K:
-            var a_row = by * TILE_M + ty
-            var a_col = kt + tx
-            if a_row < M and a_col < K:
-                tile_a[ty, tx] = A[a_row, a_col]
+
+        for kt_idx in range(K // BK):
+            var kt = kt_idx * BK
+            var row = by * BM + ty
+            var col = kt + tx
+            if row < M and col < K:
+                tile_a[ty, tx] = A[row, col]
             else:
                 tile_a[ty, tx] = 0.0
 
-            var b_row = kt + ty
-            var b_col = bx * TILE_N + tx
-            if b_row < K and b_col < N:
-                tile_b[ty, tx] = B[b_row, b_col]
+            row = kt + ty
+            col = bx * BN + tx
+            if row < K and col < N:
+                tile_b[ty, tx] = B[row, col]
             else:
                 tile_b[ty, tx] = 0.0
 
             barrier()
 
-            comptime for ki in range(TILE_K):
+            comptime for ki in range(BK):
                 acc += tile_a[ty, ki] * tile_b[ki, tx]
 
             barrier()
 
-            kt += TILE_K
-
-        var row = by * TILE_M + ty
-        var col = bx * TILE_N + tx
+        row = by * BM + ty
+        col = bx * BN + tx
         if row < M and col < N:
             C[row, col] = acc
 
@@ -80,7 +76,6 @@ def bench[size: Int]() raises:
     var buf_a = ctx.enqueue_create_buffer[float_dtype](M * K)
     var buf_b = ctx.enqueue_create_buffer[float_dtype](K * N)
     var buf_c = ctx.enqueue_create_buffer[float_dtype](M * N)
-
     var ha = ctx.enqueue_create_host_buffer[float_dtype](M * K)
     var hb = ctx.enqueue_create_host_buffer[float_dtype](K * N)
     var hc = ctx.enqueue_create_host_buffer[float_dtype](M * N)
@@ -102,23 +97,12 @@ def bench[size: Int]() raises:
     var db = TileTensor(buf_b, b_layout)
     var dc = TileTensor(buf_c, c_layout)
 
-    comptime num_blocks_x = ceildiv(N, TILE_N)
-    comptime num_blocks_y = ceildiv(M, TILE_M)
-
-    ctx.enqueue_function[kernel](
-        da, db, dc,
-        grid_dim=(num_blocks_x, num_blocks_y),
-        block_dim=(TILE_N, TILE_M),
-    )
+    ctx.enqueue_function[kernel](da, db, dc, grid_dim=(grid_x, grid_y), block_dim=(BN, BM))
     ctx.synchronize()
 
     var t0 = perf_counter()
     for _ in range(10):
-        ctx.enqueue_function[kernel](
-            da, db, dc,
-            grid_dim=(num_blocks_x, num_blocks_y),
-            block_dim=(TILE_N, TILE_M),
-        )
+        ctx.enqueue_function[kernel](da, db, dc, grid_dim=(grid_x, grid_y), block_dim=(BN, BM))
     ctx.synchronize()
     var t1 = perf_counter()
     var elapsed = (t1 - t0) / 10.0
@@ -145,11 +129,11 @@ def bench[size: Int]() raises:
 
 def main() raises:
     comptime if not has_accelerator():
-        print("No GPU accelerator detected")
-        print("Mojo GPU benchmark requires a Metal (macOS) or CUDA (NVIDIA) GPU")
+        print("No GPU accelerator detected — requires Metal (macOS) or CUDA (NVIDIA)")
     else:
-        print("--- Mojo GPU Matmul (32x32 tile, while-loop) ---")
+        print("--- Mojo GPU Matmul (", BM, "x", BN, " tile, BK=", BK, ") ---")
         print("Device: auto (Metal on macOS, CUDA on NVIDIA)")
         bench[256]()
         bench[512]()
         bench[1024]()
+        bench[2048]()
