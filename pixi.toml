@@ -1,0 +1,12 @@
+[workspace]
+authors = ["Alistair Keiller <alistair@keiller.net>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "warp_vs_mojo"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+mojo = ">=1.0.0b2.dev2026051306,<2"
+warp-lang = ">=1.11.1,<2"
