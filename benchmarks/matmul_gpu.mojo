@@ -115,7 +115,6 @@ def bench[size: Int]() raises:
         comptime b_rem = b_elems % VEC_W
 
         for kt in range(0, K, BK):
-
             comptime for j in range(a_groups):
                 var idx = tid * a_elems + j * VEC_W
                 var r = idx // BK
