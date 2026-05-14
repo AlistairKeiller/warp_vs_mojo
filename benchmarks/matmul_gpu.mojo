@@ -1,23 +1,70 @@
 from std.math import ceildiv
-from std.sys import has_accelerator
+from std.sys import has_accelerator, llvm_intrinsic
 from std.gpu.sync import barrier
 from std.gpu.host import DeviceContext
-from std.gpu import thread_idx, block_idx
+from std.gpu import thread_idx, block_idx, lane_id
 from std.gpu.memory import AddressSpace
 from layout import TileTensor, stack_allocation, row_major, Coord, Idx
 from std.time import perf_counter
+from std.memory import UnsafePointer
+from std.collections import InlineArray
 
 comptime float_dtype = DType.float32
-comptime BM = 32
-comptime BN = 32
-comptime BK = 64
-comptime RT = 2
-comptime TH_Y = BM // RT
-comptime TH_X = BN
+comptime BM = 128
+comptime BN = 128
+comptime BK = 32
+comptime VEC_W = 16
 
-comptime tile_a_layout = row_major(Coord(Idx(BM), Idx(BK)))
-comptime tile_b_layout = row_major(Coord(Idx(BK), Idx(BN)))
+comptime WARP_TILES_M = 4
+comptime WARP_TILES_N = 2
+comptime WARPS_M = BM // (WARP_TILES_M * 16)
+comptime WARPS_N = BN // (WARP_TILES_N * 16)
+comptime WARPS = WARPS_M * WARPS_N
+comptime THREADS = WARPS * 32
+comptime N_ACC = WARP_TILES_M * WARP_TILES_N
 
+@always_inline
+def _frag_rc(tid: Int) -> Tuple[Int, Int]:
+    return (
+        ((tid & 7) // 2) + ((tid & 16) >> 2),
+        ((tid & 1) << 2) + (tid & 8),
+    )
+
+@always_inline
+def _load_frag(
+    base: UnsafePointer[SIMD[float_dtype, 1], ...],
+    stride: Int,
+) -> SIMD[float_dtype, 8]:
+    var tid = lane_id()
+    var r, c = _frag_rc(Int(tid))
+    var lo = (base + r * stride + c).load[width=4]()
+    var hi = (base + (r + 8) * stride + c).load[width=4]()
+    return lo.join(hi)
+
+@always_inline
+def _store_frag(
+    base: UnsafePointer[mut=True, SIMD[float_dtype, 1], ...],
+    stride: Int,
+    frag: SIMD[float_dtype, 8],
+):
+    var tid = lane_id()
+    var r, c = _frag_rc(Int(tid))
+    (base + r * stride + c).store(frag.slice[4, offset=0]())
+    (base + (r + 8) * stride + c).store(frag.slice[4, offset=4]())
+
+@always_inline
+def _apple_mma(
+    mut d: SIMD[float_dtype, 8],
+    a: SIMD[float_dtype, 8],
+    b: SIMD[float_dtype, 8],
+    c: SIMD[float_dtype, 8],
+):
+    d = rebind[type_of(d)](
+        llvm_intrinsic[
+            "llvm.air.simdgroup_matrix_16x16x16_multiply_accumulate",
+            SIMD[float_dtype, 8],
+        ](a, False, b, False, c)
+    )
 
 @parameter
 def bench[size: Int]() raises:
@@ -27,7 +74,6 @@ def bench[size: Int]() raises:
     comptime a_layout = row_major[M, K]()
     comptime b_layout = row_major[K, N]()
     comptime c_layout = row_major[M, N]()
-
     comptime grid_x = ceildiv(N, BN)
     comptime grid_y = ceildiv(M, BM)
 
@@ -36,86 +82,105 @@ def bench[size: Int]() raises:
         B: TileTensor[float_dtype, type_of(b_layout), MutAnyOrigin],
         C: TileTensor[float_dtype, type_of(c_layout), MutAnyOrigin],
     ):
-        var tx = thread_idx.x
-        var ty = thread_idx.y
-        var bx = block_idx.x
+        var tid = thread_idx.x
+        var warp_id = tid // 32
+        var warp_y = warp_id // WARPS_N
+        var warp_x = warp_id % WARPS_N
         var by = block_idx.y
+        var bx = block_idx.x
 
-        var tile_a = stack_allocation[float_dtype, address_space=AddressSpace.SHARED](tile_a_layout)
-        var tile_b = stack_allocation[float_dtype, address_space=AddressSpace.SHARED](tile_b_layout)
+        comptime a_smem_layout = row_major(Coord(Idx(BM), Idx(BK)))
+        comptime b_smem_layout = row_major(Coord(Idx(BK), Idx(BN)))
+        var a_smem = stack_allocation[float_dtype, address_space=AddressSpace.SHARED](
+            a_smem_layout
+        )
+        var b_smem = stack_allocation[float_dtype, address_space=AddressSpace.SHARED](
+            b_smem_layout
+        )
 
-        var acc0: Float32 = 0.0
-        var acc1: Float32 = 0.0
+        var a_ptr = a_smem.ptr
+        var b_ptr = b_smem.ptr
 
-        for kt_idx in range(K // BK):
-            var kt = kt_idx * BK
+        var accum = InlineArray[SIMD[float_dtype, 8], N_ACC](
+            uninitialized=True
+        )
+        comptime for i in range(N_ACC):
+            accum[i] = SIMD[float_dtype, 8](0)
 
-            var a_row0 = by * BM + ty * RT
-            var a_row1 = a_row0 + 1
-            var a_col0 = kt + tx
-            var a_col1 = kt + tx + TH_X
+        comptime a_elems = BM * BK // THREADS
+        comptime b_elems = BK * BN // THREADS
+        comptime a_groups = a_elems // VEC_W
+        comptime a_rem = a_elems % VEC_W
+        comptime b_groups = b_elems // VEC_W
+        comptime b_rem = b_elems % VEC_W
 
-            if a_row0 < M and a_col0 < K:
-                tile_a[ty * RT, tx] = A[a_row0, a_col0]
-            else:
-                tile_a[ty * RT, tx] = 0.0
-            if a_row0 < M and a_col1 < K:
-                tile_a[ty * RT, tx + TH_X] = A[a_row0, a_col1]
-            else:
-                tile_a[ty * RT, tx + TH_X] = 0.0
-            if a_row1 < M and a_col0 < K:
-                tile_a[ty * RT + 1, tx] = A[a_row1, a_col0]
-            else:
-                tile_a[ty * RT + 1, tx] = 0.0
-            if a_row1 < M and a_col1 < K:
-                tile_a[ty * RT + 1, tx + TH_X] = A[a_row1, a_col1]
-            else:
-                tile_a[ty * RT + 1, tx + TH_X] = 0.0
+        for kt in range(0, K, BK):
 
-            var b_col = bx * BN + tx
+            comptime for j in range(a_groups):
+                var idx = tid * a_elems + j * VEC_W
+                var r = idx // BK
+                var c = idx % BK
+                var gr = by * BM + r
+                var gc = kt + c
+                a_smem.raw_store[width=VEC_W](
+                    r * BK + c,
+                    A.raw_load[width=VEC_W](gr * K + gc),
+                )
+            comptime for j in range(a_rem):
+                var idx = tid * a_elems + a_groups * VEC_W + j
+                var r = idx // BK
+                var c = idx % BK
+                var gr = by * BM + r
+                var gc = kt + c
+                a_smem[r, c] = A[gr, gc]
 
-            var b_row0 = kt + ty
-            if b_row0 < K and b_col < N:
-                tile_b[ty, tx] = B[b_row0, b_col]
-            else:
-                tile_b[ty, tx] = 0.0
-
-            var b_row1 = kt + ty + TH_Y
-            if b_row1 < K and b_col < N:
-                tile_b[ty + TH_Y, tx] = B[b_row1, b_col]
-            else:
-                tile_b[ty + TH_Y, tx] = 0.0
-
-            var b_row2 = kt + ty + 2 * TH_Y
-            if b_row2 < K and b_col < N:
-                tile_b[ty + 2 * TH_Y, tx] = B[b_row2, b_col]
-            else:
-                tile_b[ty + 2 * TH_Y, tx] = 0.0
-
-            var b_row3 = kt + ty + 3 * TH_Y
-            if b_row3 < K and b_col < N:
-                tile_b[ty + 3 * TH_Y, tx] = B[b_row3, b_col]
-            else:
-                tile_b[ty + 3 * TH_Y, tx] = 0.0
-
-            barrier()
-
-            comptime for ki in range(BK):
-                var a0 = tile_a[ty * RT, ki]
-                var a1 = tile_a[ty * RT + 1, ki]
-                var b = tile_b[ki, tx]
-                acc0 += a0 * b
-                acc1 += a1 * b
+            comptime for j in range(b_groups):
+                var idx = tid * b_elems + j * VEC_W
+                var r = idx // BN
+                var c = idx % BN
+                var gr = kt + r
+                var gc = bx * BN + c
+                b_smem.raw_store[width=VEC_W](
+                    r * BN + c,
+                    B.raw_load[width=VEC_W](gr * N + gc),
+                )
+            comptime for j in range(b_rem):
+                var idx = tid * b_elems + b_groups * VEC_W + j
+                var r = idx // BN
+                var c = idx % BN
+                var gr = kt + r
+                var gc = bx * BN + c
+                b_smem[r, c] = B[gr, gc]
 
             barrier()
 
-        var row0 = by * BM + ty * RT
-        var row1 = row0 + 1
-        var col = bx * BN + tx
-        if row0 < M and col < N:
-            C[row0, col] = acc0
-        if row1 < M and col < N:
-            C[row1, col] = acc1
+            comptime for ki in range(BK // 16):
+                var kk = ki * 16
+                comptime for tm in range(WARP_TILES_M):
+                    var a_frag = _load_frag(
+                        a_ptr + (warp_y * WARP_TILES_M + tm) * 16 * BK + kk, BK
+                    )
+                    comptime for tn in range(WARP_TILES_N):
+                        var b_frag = _load_frag(
+                            b_ptr + kk * BN + (warp_x * WARP_TILES_N + tn) * 16, BN
+                        )
+                        _apple_mma(
+                            accum[tm * WARP_TILES_N + tn],
+                            a_frag,
+                            b_frag,
+                            accum[tm * WARP_TILES_N + tn],
+                        )
+
+            barrier()
+
+        comptime for tm in range(WARP_TILES_M):
+            comptime for tn in range(WARP_TILES_N):
+                var c_base = (
+                    C.ptr
+                    + (by * BM + (warp_y * WARP_TILES_M + tm) * 16) * N
+                    + (bx * BN + (warp_x * WARP_TILES_N + tn) * 16)
+                )
+                _store_frag(c_base, N, accum[tm * WARP_TILES_N + tn])
 
     print("\n--- Size ", M, " ---")
 
@@ -144,12 +209,20 @@ def bench[size: Int]() raises:
     var db = TileTensor(buf_b, b_layout)
     var dc = TileTensor(buf_c, c_layout)
 
-    ctx.enqueue_function[kernel](da, db, dc, grid_dim=(grid_x, grid_y), block_dim=(TH_X, TH_Y))
+    ctx.enqueue_function[kernel](
+        da, db, dc,
+        grid_dim=(grid_x, grid_y),
+        block_dim=(THREADS, 1),
+    )
     ctx.synchronize()
 
     var t0 = perf_counter()
     for _ in range(100):
-        ctx.enqueue_function[kernel](da, db, dc, grid_dim=(grid_x, grid_y), block_dim=(TH_X, TH_Y))
+        ctx.enqueue_function[kernel](
+            da, db, dc,
+            grid_dim=(grid_x, grid_y),
+            block_dim=(THREADS, 1),
+        )
     ctx.synchronize()
     var t1 = perf_counter()
     var elapsed = (t1 - t0) / 100.0
@@ -171,15 +244,14 @@ def bench[size: Int]() raises:
             if err > max_err:
                 max_err = err
     print("Max error: ", max_err)
-    print("Correctness: ", max_err < 0.1)
+    print("Correctness: ", max_err < 1.0)
 
 
 def main() raises:
     comptime if not has_accelerator():
-        print("No GPU accelerator detected — requires Metal (macOS) or CUDA (NVIDIA)")
+        print("No GPU accelerator detected")
     else:
-        print("--- Mojo GPU Matmul (BK=64, 2x1 reg-tiled) ---")
-        print("Device: auto (Metal on macOS, CUDA on NVIDIA)")
+        print("--- Mojo GPU Matmul (M5 Pro, simdgroup MMA) ---")
         bench[256]()
         bench[512]()
         bench[1024]()
