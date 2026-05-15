@@ -47,8 +47,15 @@ echo ""
 
 # ── 3. Mojo specialized kernel ──
 if [ "$gpu_type" = "nvidia" ]; then
-    echo -e "${YELLOW}═══ Mojo T4 Tensor-Core MMA Kernel ═══${NC}"
-    pixi run mojo matmul_t4.mojo
+    # Check if Blackwell GPU (sm_120a)
+    sm_version=$(pixi run python3 -c "import torch; v=torch.cuda.get_device_capability(); print(f'{v[0]}{v[1]}')" 2>/dev/null)
+    if [ "$sm_version" = "120" ]; then
+        echo -e "${YELLOW}═══ Mojo Blackwell tcgen05 MMA Kernel ═══${NC}"
+        pixi run mojo matmul_rtxpro6000.mojo
+    else
+        echo -e "${YELLOW}═══ Mojo T4 Tensor-Core MMA Kernel ═══${NC}"
+        pixi run mojo matmul_t4.mojo
+    fi
 elif [ "$gpu_type" = "apple" ]; then
     echo -e "${YELLOW}═══ Mojo M5 Pro Simdgroup MMA Kernel ═══${NC}"
     pixi run mojo matmul_m5pro.mojo
