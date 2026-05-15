@@ -7,6 +7,7 @@ from std.gpu import thread_idx, block_idx, lane_id
 from std.gpu.memory import AddressSpace
 from layout import TileTensor, stack_allocation, row_major, Coord, Idx
 from std.time import perf_counter
+from std.memory import bitcast
 
 comptime float_dtype = DType.float32
 
@@ -112,15 +113,16 @@ def bench[size: Int]() raises:
 
                 # Tensor core MMA: D = A × B + C (m8n8k4, F16×F16+F32→F32)
                 # Use inline PTX for sm_75 (T4) compatibility.
-                # The stdlib mma() m8n8k4 path uses an LLVM intrinsic that
-                # returns 8×F32, incompatible with this LLVM version.
+                # Bitcast F16 to UInt16 for .b16 PTX register type.
+                var a_b16 = bitcast[DType.uint16, 1](a_val)
+                var b_b16 = bitcast[DType.uint16, 1](b_val)
                 var r = inlined_assembly[
                     "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 " +
-                    "{$0, $1}, {$2}, {$3}, {$4, $5};",
+                    "{$0, $1}, $2, $3, {$4, $5};",
                     _RegisterPackType[Float32, Float32],
                     constraints="=f,=f,h,h,f,f",
                 ](
-                    a_val, b_val,
+                    a_b16, b_b16,
                     accum[0], accum[1],
                 )
                 accum = SIMD[DType.float32, 2](r[0], r[1])
