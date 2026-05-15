@@ -1,4 +1,4 @@
-from std.math import ceildiv, min
+from std.math import ceildiv, min, fma
 from std.sys import has_accelerator
 from std.gpu.sync import barrier
 from std.gpu.host import DeviceContext
@@ -11,9 +11,10 @@ from std.collections import InlineArray
 comptime float_dtype = DType.float32
 comptime BM = 64
 comptime BN = 64
-comptime BK = 32
+comptime BN_PAD = BN + 1
+comptime BK = 16
 comptime BK_PAD = BK + 1
-comptime VEC_W = 16
+comptime VEC_W = 4
 comptime THREADS_M = 16
 comptime THREADS_N = 16
 comptime THREADS = THREADS_M * THREADS_N
@@ -21,7 +22,7 @@ comptime ELEMS_M = BM // THREADS_M
 comptime ELEMS_N = BN // THREADS_N
 
 comptime a_smem_layout = row_major(Coord(Idx(BM), Idx(BK_PAD)))
-comptime b_smem_layout = row_major(Coord(Idx(BK), Idx(BN)))
+comptime b_smem_layout = row_major(Coord(Idx(BK), Idx(BN_PAD)))
 
 @parameter
 def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
@@ -85,7 +86,7 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
                     var r = idx // BN
                     var c = idx % BN
                     b_smem.raw_store[width=VEC_W](
-                        r * BN + c, SIMD[float_dtype, VEC_W](0)
+                        r * BN_PAD + c, SIMD[float_dtype, VEC_W](0)
                     )
                 comptime for j in range(b_rem):
                     var idx = tid * b_elems + b_groups * VEC_W + j
@@ -127,7 +128,7 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
                 var gc = n_start + c
                 if gr < K and gc + VEC_W <= N:
                     b_smem.raw_store[width=VEC_W](
-                        r * BN + c,
+                        r * BN_PAD + c,
                         B.raw_load[width=VEC_W](gr * N + gc),
                     )
                 else:
@@ -135,7 +136,7 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
                     for k in range(VEC_W):
                         if gr < K and gc + k < N:
                             v[k] = B[gr, gc + k]
-                    b_smem.raw_store[width=VEC_W](r * BN + c, v)
+                    b_smem.raw_store[width=VEC_W](r * BN_PAD + c, v)
             comptime for j in range(b_rem):
                 var idx = tid * b_elems + b_groups * VEC_W + j
                 var r = idx // BN
@@ -151,12 +152,12 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
 
             comptime for kk in range(BK):
                 var b_vals = b_smem.raw_load[width=ELEMS_N](
-                    kk * BN + tx * ELEMS_N
+                    kk * BN_PAD + tx * ELEMS_N
                 )
                 comptime for i in range(ELEMS_M):
                     var a_val = a_smem[ty * ELEMS_M + i, kk]
                     comptime for j in range(ELEMS_N):
-                        accum[i][j] += a_val * b_vals[j]
+                        accum[i][j] = fma(a_val, b_vals[j], accum[i][j])
 
             barrier()
 
@@ -244,7 +245,7 @@ def main() raises:
         print("No GPU accelerator detected")
         return
 
-    print("--- General-Purpose Mojo GPU GEMM (tiled FMA, padded A-smem stride) ---")
+    print("--- General-Purpose Mojo GPU GEMM (BM=64, BN=64, BK=16, VEC_W=4, fma, padded) ---")
     print("Tile-aligned square matrices:")
     bench[256, 256, 256]()
     bench[512, 512, 512]()
