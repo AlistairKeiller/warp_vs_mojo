@@ -90,28 +90,23 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
 
             barrier()
 
-            comptime for kk in range(BK):
+            for kk in range(BK):
                 var b_vals = b_smem.raw_load[width=ELEMS_N](
                     kk * BN_PAD + tx * ELEMS_N
                 )
-                comptime for i in range(ELEMS_M):
+                for i in range(ELEMS_M):
                     var a_val = a_smem[ty * ELEMS_M + i, kk]
-                    comptime for j in range(ELEMS_N):
-                        accum[i][j] = fma(a_val, b_vals[j], accum[i][j])
+                    for j in range(ELEMS_N):
+                        accum[i][j] += a_val * b_vals[j]
 
             barrier()
 
-        comptime for i in range(ELEMS_M):
+        for i in range(ELEMS_M):
             var crow = m_start + ty * ELEMS_M + i
-            var ccol = n_start + tx * ELEMS_N
-            if crow < M and ccol + ELEMS_N <= N:
-                C.raw_store[width=ELEMS_N](
-                    crow * N + ccol, accum[i]
-                )
-            else:
-                for j in range(ELEMS_N):
-                    if crow < M and ccol + j < N:
-                        C[crow, ccol + j] = accum[i][j]
+            for j in range(ELEMS_N):
+                var ccol = n_start + tx * ELEMS_N + j
+                if crow < M and ccol < N:
+                    C[crow, ccol] = accum[i][j]
 
     print("\n--- Size ", M, " ---")
 
@@ -185,7 +180,7 @@ def main() raises:
         print("No GPU accelerator detected")
         return
 
-    print("--- General-Purpose Mojo GPU GEMM (BM=64, BN=64, BK=16, VEC_W=4, fma, padded) ---")
+    print("--- General-Purpose Mojo GPU GEMM (BM=64, BN=64, BK=32, runtime loops) ---")
     print("Tile-aligned square matrices:")
     bench[256, 256, 256]()
     bench[512, 512, 512]()
