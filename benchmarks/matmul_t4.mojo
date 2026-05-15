@@ -1,11 +1,12 @@
 from std.math import ceildiv
-from std.sys import has_accelerator
+from std.sys import has_accelerator, _RegisterPackType
+from std.sys._assembly import inlined_assembly
 from std.gpu.sync import barrier
 from std.gpu.host import DeviceContext
 from std.gpu import thread_idx, block_idx, lane_id
 from std.gpu.memory import AddressSpace
-from std.gpu.compute.mma import mma
 from layout import TileTensor, stack_allocation, row_major, Coord, Idx
+from std.memory import bitcast
 from std.time import perf_counter
 
 comptime float_dtype = DType.float32
@@ -114,7 +115,24 @@ def bench[size: Int]() raises:
                 )
 
                 # Tensor core MMA: D = A × B + C (F16×F16+F32→F32)
-                mma(accum, a_frag, b_frag, accum)
+                # Using inline PTX for sm_75 (T4) compatibility
+                # stdlib mma() emits llvm.nvvm.mma.m16n8k8.row.col.f32.f32
+                # which is sm_80+ only; T4 requires explicit PTX
+                var sa = a_frag.split()
+                var a0 = bitcast[DType.uint32, 1](sa[0])
+                var a1 = bitcast[DType.uint32, 1](sa[1])
+                var b0 = bitcast[DType.uint32, 1](b_frag)
+                var c_arr = bitcast[DType.float32, 4](accum)
+                var r = inlined_assembly[
+                    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 " +
+                    "{$0, $1, $2, $3}, {$4, $5}, $6, {$7, $8, $9, $10};",
+                    _RegisterPackType[Float32, Float32, Float32, Float32],
+                    constraints="=f,=f,=f,=f,r,r,r,f,f,f,f",
+                ](
+                    a0, a1, b0,
+                    c_arr[0], c_arr[1], c_arr[2], c_arr[3],
+                )
+                accum = SIMD[DType.float32, 4](r[0], r[1], r[2], r[3])
 
             barrier()
 
