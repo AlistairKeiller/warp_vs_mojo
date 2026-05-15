@@ -1,10 +1,10 @@
 from std.math import ceildiv
-from std.sys import has_accelerator
+from std.sys import has_accelerator, _RegisterPackType
+from std.sys._assembly import inlined_assembly
 from std.gpu.sync import barrier
 from std.gpu.host import DeviceContext
 from std.gpu import thread_idx, block_idx, lane_id
 from std.gpu.memory import AddressSpace
-from std.gpu.compute.mma import mma
 from layout import TileTensor, stack_allocation, row_major, Coord, Idx
 from std.time import perf_counter
 
@@ -111,7 +111,19 @@ def bench[size: Int]() raises:
                 var b_val = b_smem[kk + lane_col, warp_x * 8 + lane_row]
 
                 # Tensor core MMA: D = A × B + C (m8n8k4, F16×F16+F32→F32)
-                mma(accum, a_val, b_val, accum)
+                # Use inline PTX for sm_75 (T4) compatibility.
+                # The stdlib mma() m8n8k4 path uses an LLVM intrinsic that
+                # returns 8×F32, incompatible with this LLVM version.
+                var r = inlined_assembly[
+                    "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 " +
+                    "{$0, $1}, {$2}, {$3}, {$4, $5};",
+                    _RegisterPackType[Float32, Float32],
+                    constraints="=f,=f,h,h,f,f",
+                ](
+                    a_val, b_val,
+                    accum[0], accum[1],
+                )
+                accum = SIMD[DType.float32, 2](r[0], r[1])
 
             barrier()
 
