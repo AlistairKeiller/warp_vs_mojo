@@ -56,10 +56,6 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
 
         comptime a_elems = BM * BK // THREADS
         comptime b_elems = BK * BN // THREADS
-        comptime a_groups = a_elems // VEC_W
-        comptime a_rem = a_elems % VEC_W
-        comptime b_groups = b_elems // VEC_W
-        comptime b_rem = b_elems % VEC_W
 
         var accum = InlineArray[SIMD[float_dtype, ELEMS_N], ELEMS_M](
             uninitialized=True
@@ -68,49 +64,9 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
             accum[i] = SIMD[float_dtype, ELEMS_N](0)
 
         for kt in range(0, K, BK):
-            var kb = min(BK, K - kt)
-
-            if kb < BK:
-                comptime for j in range(a_groups):
-                    var idx = tid * a_elems + j * VEC_W
-                    var r = idx // BK
-                    var c = idx % BK
-                    a_smem.raw_store[width=VEC_W](
-                        r * BK_PAD + c, SIMD[float_dtype, VEC_W](0)
-                    )
-                comptime for j in range(a_rem):
-                    var idx = tid * a_elems + a_groups * VEC_W + j
-                    a_smem[idx // BK, idx % BK] = 0.0
-                comptime for j in range(b_groups):
-                    var idx = tid * b_elems + j * VEC_W
-                    var r = idx // BN
-                    var c = idx % BN
-                    b_smem.raw_store[width=VEC_W](
-                        r * BN_PAD + c, SIMD[float_dtype, VEC_W](0)
-                    )
-                comptime for j in range(b_rem):
-                    var idx = tid * b_elems + b_groups * VEC_W + j
-                    b_smem[idx // BN, idx % BN] = 0.0
-
-            comptime for j in range(a_groups):
-                var idx = tid * a_elems + j * VEC_W
-                var r = idx // BK
-                var c = idx % BK
-                var gr = m_start + r
-                var gc = kt + c
-                if gr < M and gc + VEC_W <= K:
-                    a_smem.raw_store[width=VEC_W](
-                        r * BK_PAD + c,
-                        A.raw_load[width=VEC_W](gr * K + gc),
-                    )
-                else:
-                    var v = SIMD[float_dtype, VEC_W](0)
-                    for k in range(VEC_W):
-                        if gr < M and gc + k < K:
-                            v[k] = A[gr, gc + k]
-                    a_smem.raw_store[width=VEC_W](r * BK_PAD + c, v)
-            comptime for j in range(a_rem):
-                var idx = tid * a_elems + a_groups * VEC_W + j
+            # Load A tile: global → shared (scalar stores = no bank conflict)
+            comptime for j in range(a_elems):
+                var idx = tid * a_elems + j
                 var r = idx // BK
                 var c = idx % BK
                 var gr = m_start + r
@@ -120,25 +76,9 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
                 else:
                     a_smem[r, c] = 0.0
 
-            comptime for j in range(b_groups):
-                var idx = tid * b_elems + j * VEC_W
-                var r = idx // BN
-                var c = idx % BN
-                var gr = kt + r
-                var gc = n_start + c
-                if gr < K and gc + VEC_W <= N:
-                    b_smem.raw_store[width=VEC_W](
-                        r * BN_PAD + c,
-                        B.raw_load[width=VEC_W](gr * N + gc),
-                    )
-                else:
-                    var v = SIMD[float_dtype, VEC_W](0)
-                    for k in range(VEC_W):
-                        if gr < K and gc + k < N:
-                            v[k] = B[gr, gc + k]
-                    b_smem.raw_store[width=VEC_W](r * BN_PAD + c, v)
-            comptime for j in range(b_rem):
-                var idx = tid * b_elems + b_groups * VEC_W + j
+            # Load B tile: global → shared (scalar stores = no bank conflict)
+            comptime for j in range(b_elems):
+                var idx = tid * b_elems + j
                 var r = idx // BN
                 var c = idx % BN
                 var gr = kt + r
