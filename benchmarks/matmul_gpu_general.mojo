@@ -1,4 +1,4 @@
-from std.math import ceildiv, min, fma
+from std.math import ceildiv, min
 from std.sys import has_accelerator
 from std.gpu.sync import barrier
 from std.gpu.host import DeviceContext
@@ -90,23 +90,28 @@ def bench[size_m: Int, size_n: Int, size_k: Int]() raises:
 
             barrier()
 
-            for kk in range(BK):
+            comptime for kk in range(BK):
                 var b_vals = b_smem.raw_load[width=ELEMS_N](
                     kk * BN_PAD + tx * ELEMS_N
                 )
-                for i in range(ELEMS_M):
+                comptime for i in range(ELEMS_M):
                     var a_val = a_smem[ty * ELEMS_M + i, kk]
-                    for j in range(ELEMS_N):
+                    comptime for j in range(ELEMS_N):
                         accum[i][j] += a_val * b_vals[j]
 
             barrier()
 
-        for i in range(ELEMS_M):
+        comptime for i in range(ELEMS_M):
             var crow = m_start + ty * ELEMS_M + i
-            for j in range(ELEMS_N):
-                var ccol = n_start + tx * ELEMS_N + j
-                if crow < M and ccol < N:
-                    C[crow, ccol] = accum[i][j]
+            var ccol = n_start + tx * ELEMS_N
+            if crow < M and ccol + ELEMS_N <= N:
+                C.raw_store[width=ELEMS_N](
+                    crow * N + ccol, accum[i]
+                )
+            else:
+                for j in range(ELEMS_N):
+                    if crow < M and ccol + j < N:
+                        C[crow, ccol + j] = accum[i][j]
 
     print("\n--- Size ", M, " ---")
 
