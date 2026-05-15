@@ -9,5 +9,3 @@ version = "0.1.0"
 
 [dependencies]
 mojo = ">=1.0.0b2.dev2026051306,<2"
-warp-lang = ">=1.11.1,<2"
-pytorch = ">=2.10.0,<3"
