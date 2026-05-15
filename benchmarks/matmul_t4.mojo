@@ -1,24 +1,28 @@
 from std.math import ceildiv
-from std.sys import has_accelerator, _RegisterPackType
-from std.sys._assembly import inlined_assembly
+from std.sys import has_accelerator
 from std.gpu.sync import barrier
 from std.gpu.host import DeviceContext
 from std.gpu import thread_idx, block_idx, lane_id
 from std.gpu.memory import AddressSpace
+from std.gpu.compute.mma import mma
 from layout import TileTensor, stack_allocation, row_major, Coord, Idx
-from std.memory import bitcast
 from std.time import perf_counter
 
 comptime float_dtype = DType.float32
+
+# m8n8k4: each warp produces 8×8 output, each thread: 1 F16 (a), 1 F16 (b), 2 F32 (d)
 comptime BM = 64
-comptime BN = 64
+comptime BN = 32
 comptime BK = 32
-comptime WARPS_M = BM // 16
+
+comptime WARPS_M = BM // 8
 comptime WARPS_N = BN // 8
 comptime WARPS = WARPS_M * WARPS_N
 comptime THREADS = WARPS * 32
-comptime A_ELEMS_PER_THREAD = BM * BK // THREADS
-comptime B_ELEMS_PER_THREAD = BK * BN // THREADS
+
+# Per-thread elements for global→shared loads
+comptime A_ELEMS = BM * BK // THREADS
+comptime B_ELEMS = BK * BN // THREADS
 
 comptime a_smem_layout = row_major(Coord(Idx(BM), Idx(BK)))
 comptime b_smem_layout = row_major(Coord(Idx(BK), Idx(BN)))
@@ -62,13 +66,13 @@ def bench[size: Int]() raises:
             b_smem_layout
         )
 
-        # Accumulator: 4 F32 per thread (16×8 tile per warp)
-        var accum = SIMD[DType.float32, 4](0)
+        # Accumulator: 2 F32 per thread (m8n8k4 output)
+        var accum = SIMD[DType.float32, 2](0)
 
         for kt in range(0, K, BK):
             # Load A tile: global F32 → shared F16
-            comptime for j in range(A_ELEMS_PER_THREAD):
-                var idx = tid * A_ELEMS_PER_THREAD + j
+            comptime for j in range(A_ELEMS):
+                var idx = tid * A_ELEMS + j
                 var r = idx // BK
                 var c = idx % BK
                 var gr = m_start + r
@@ -79,8 +83,8 @@ def bench[size: Int]() raises:
                     a_smem[r, c] = 0.0
 
             # Load B tile: global F32 → shared F16
-            comptime for j in range(B_ELEMS_PER_THREAD):
-                var idx = tid * B_ELEMS_PER_THREAD + j
+            comptime for j in range(B_ELEMS):
+                var idx = tid * B_ELEMS + j
                 var r = idx // BN
                 var c = idx % BN
                 var gr = kt + r
@@ -92,73 +96,37 @@ def bench[size: Int]() raises:
 
             barrier()
 
-            # MMA loop: 4 iterations × K=8 = BK=32
-            comptime for ki in range(BK // 8):
-                var kk = ki * 8
+            # MMA loop: (BK/4) iterations × K=4 = BK
+            comptime for ki in range(BK // 4):
+                var kk = ki * 4
+                var lane_row = lane // 4
+                var lane_col = lane % 4
 
-                # Construct A fragment (4 F16 per thread, 2×2 block)
-                var a_ro = (lane >> 2) * 2
-                var a_co = (lane & 3) * 2
-                var a_frag = SIMD[DType.float16, 4](
-                    a_smem[warp_y * 16 + a_ro, kk + a_co],
-                    a_smem[warp_y * 16 + a_ro, kk + a_co + 1],
-                    a_smem[warp_y * 16 + a_ro + 1, kk + a_co],
-                    a_smem[warp_y * 16 + a_ro + 1, kk + a_co + 1],
-                )
+                # A fragment: 1 F16 per thread (row-major, 8×4)
+                # row = lane//4 (0-7), col = lane%4 (0-3)
+                var a_val = a_smem[warp_y * 8 + lane_row, kk + lane_col]
 
-                # Construct B fragment (2 F16 per thread, 2×1 vertical pair)
-                var b_ro = (lane >> 3) * 2
-                var b_co = lane & 7
-                var b_frag = SIMD[DType.float16, 2](
-                    b_smem[kk + b_ro, warp_x * 8 + b_co],
-                    b_smem[kk + b_ro + 1, warp_x * 8 + b_co],
-                )
+                # B fragment: 1 F16 per thread (column-major, 4×8)
+                # row = lane%4 (0-3), col = lane//4 (0-7)
+                var b_val = b_smem[kk + lane_col, warp_x * 8 + lane_row]
 
-                # Tensor core MMA: D = A × B + C (F16×F16+F32→F32)
-                # Using inline PTX for sm_75 (T4) compatibility
-                # stdlib mma() emits llvm.nvvm.mma.m16n8k8.row.col.f32.f32
-                # which is sm_80+ only; T4 requires explicit PTX
-                var sa = a_frag.split()
-                var a0 = bitcast[DType.uint32, 1](sa[0])
-                var a1 = bitcast[DType.uint32, 1](sa[1])
-                var b0 = bitcast[DType.uint32, 1](b_frag)
-                var c_arr = bitcast[DType.float32, 4](accum)
-                var r = inlined_assembly[
-                    "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 " +
-                    "{$0, $1, $2, $3}, {$4, $5}, $6, {$7, $8, $9, $10};",
-                    _RegisterPackType[Float32, Float32, Float32, Float32],
-                    constraints="=f,=f,=f,=f,r,r,r,f,f,f,f",
-                ](
-                    a0, a1, b0,
-                    c_arr[0], c_arr[1], c_arr[2], c_arr[3],
-                )
-                accum = SIMD[DType.float32, 4](r[0], r[1], r[2], r[3])
+                # Tensor core MMA: D = A × B + C (m8n8k4, F16×F16+F32→F32)
+                mma(accum, a_val, b_val, accum)
 
             barrier()
 
-        # Write accum to global memory (4 F32, 2×2 block per thread)
-        var crow = m_start + warp_y * 16 + (lane >> 2) * 2
-        var ccol = n_start + warp_x * 8 + (lane & 3) * 2
-        if crow < M and ccol + 1 < N:
+        # Write accum to global memory (2 F32 per thread)
+        # Output mapping: meta_row = lane//4 (0-7), meta_col = lane%4 (0-3)
+        # d[0] = D[meta_row, meta_col], d[1] = D[meta_row, meta_col+4]
+        var meta_row = lane // 4
+        var meta_col = lane % 4
+        var crow = m_start + warp_y * 8 + meta_row
+        var ccol = n_start + warp_x * 8 + meta_col
+
+        if crow < M and ccol < N:
             C[crow, ccol] = accum[0]
-            C[crow, ccol + 1] = accum[1]
-            C[crow + 1, ccol] = accum[2]
-            C[crow + 1, ccol + 1] = accum[3]
-        elif crow + 1 < M and ccol < N:
-            if ccol < N:
-                C[crow, ccol] = accum[0]
-            if ccol + 1 < N:
-                C[crow, ccol + 1] = accum[1]
-            if crow + 1 < M:
-                C[crow + 1, ccol] = accum[2]
-                if ccol + 1 < N:
-                    C[crow + 1, ccol + 1] = accum[3]
-        else:
-            for j in range(4):
-                var rr = crow + j // 2
-                var cc = ccol + j % 2
-                if rr < M and cc < N:
-                    C[rr, cc] = accum[j]
+        if crow < M and ccol + 4 < N:
+            C[crow, ccol + 4] = accum[1]
 
     print("\n--- Size ", M, " ---")
 
@@ -229,7 +197,7 @@ def main() raises:
     comptime if not has_accelerator():
         print("No GPU accelerator detected")
     else:
-        print("--- Mojo GPU Matmul (T4, tensor-core MMA, F16→F32) ---")
+        print("--- Mojo GPU Matmul (T4, m8n8k4 tensor-core MMA, F16→F32) ---")
         bench[256]()
         bench[512]()
         bench[1024]()
